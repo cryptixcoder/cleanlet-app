@@ -1,9 +1,14 @@
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 import '../models/inlet.dart';
 import '../models/job.dart';
 import '../models/user.dart';
+import '../utils/geohash_utils.dart';
 import 'firebase_auth_repository.dart';
 import 'firestore_data_source.dart';
 
@@ -16,6 +21,61 @@ class FirestoreRepository {
         path: 'inlets',
         builder: (data, documentId) => Inlet.fromMap(data, documentId),
       );
+
+  Future<List<Inlet>> fetchInletsInBounds(
+      LatLngBounds bounds, double zoom, Map<String, List<Inlet>> regionCache) async {
+    final precision = GeohashUtils.precisionForZoom(zoom);
+    final centerLat =
+        (bounds.northeast.latitude + bounds.southwest.latitude) / 2;
+    final centerLng =
+        (bounds.northeast.longitude + bounds.southwest.longitude) / 2;
+
+    final centerHash = GeohashUtils.encode(centerLat, centerLng, precision);
+    final cells = GeohashUtils.getNeighborsAndSelf(centerHash);
+
+    final seen = <String>{};
+    final results = <Inlet>[];
+    final uncachedCells = <String>[];
+
+    // Serve already-visited cells from memory; only query the rest.
+    for (final cell in cells) {
+      if (regionCache.containsKey(cell)) {
+        for (final inlet in regionCache[cell]!) {
+          if (seen.add(inlet.referenceId)) results.add(inlet);
+        }
+      } else {
+        uncachedCells.add(cell);
+      }
+    }
+
+    if (uncachedCells.isNotEmpty) {
+      final futures = uncachedCells
+          .map((cell) => FirebaseFirestore.instance
+              .collection('inlets')
+              .where('gHash', isGreaterThanOrEqualTo: cell)
+              .where('gHash', isLessThan: '$cell~')
+              .get())
+          .toList();
+
+      final snapshots = await Future.wait(futures);
+
+      for (int i = 0; i < uncachedCells.length; i++) {
+        final cellInlets = <Inlet>[];
+        for (final doc in snapshots[i].docs) {
+          try {
+            final inlet = Inlet.fromMap(doc.data(), doc.id);
+            cellInlets.add(inlet);
+            if (seen.add(doc.id)) results.add(inlet);
+          } catch (_) {
+            // Skip malformed documents.
+          }
+        }
+        regionCache[uncachedCells[i]] = cellInlets;
+      }
+    }
+
+    return results;
+  }
 
   Stream<Inlet> watchInlet({required InletID inletID}) =>
       _dataSource.watchDocument(
@@ -93,6 +153,7 @@ final autoUpdateUserProvider =
     'displayName': user.displayName,
     'photoURL': user.photoURL,
     'email': user.email!,
+    'appLastUsed': FieldValue.serverTimestamp(),
   };
 
   await db.updateUser(user.uid, data: userData);
@@ -120,3 +181,33 @@ final autoUpdateUserListenerProvider = Provider<void>((ref) {
 //     }
 //   });
 // });
+
+class ViewportMapNotifier extends AutoDisposeAsyncNotifier<List<Inlet>> {
+  int _requestId = 0;
+  final Map<String, List<Inlet>> _regionCache = {};
+
+  @override
+  FutureOr<List<Inlet>> build() => [];
+
+  Future<void> updateViewport(LatLngBounds bounds, double zoom) async {
+    if (zoom < 10) {
+      state = const AsyncData([]);
+      return;
+    }
+    final id = ++_requestId;
+    state = const AsyncLoading();
+    try {
+      final inlets = await ref
+          .read(databaseProvider)
+          .fetchInletsInBounds(bounds, zoom, _regionCache);
+      if (id == _requestId) state = AsyncData(inlets);
+    } catch (e, st) {
+      if (id == _requestId) state = AsyncError(e, st);
+    }
+  }
+}
+
+final viewportMapProvider =
+    AsyncNotifierProvider.autoDispose<ViewportMapNotifier, List<Inlet>>(
+  ViewportMapNotifier.new,
+);

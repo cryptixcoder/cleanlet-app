@@ -178,6 +178,144 @@ export const archiveOldPendingJobs = onSchedule(
 );
 
 /*********************************************************
+ * Weather Digest: Re-engagement Notifications
+ *********************************************************/
+const DIGEST_INACTIVE_DAYS = 14;
+
+async function resolveNwsPoint(lat, lng, cache) {
+  const key = `${lat.toFixed(2)},${lng.toFixed(2)}`;
+  if (cache.has(key)) return cache.get(key);
+
+  const res = await fetch(`https://api.weather.gov/points/${lat},${lng}`);
+  if (!res.ok) throw new Error(`NWS points API ${res.status} for ${lat},${lng}`);
+
+  const json = await res.json();
+  const result = {
+    forecastUrl: json.properties.forecast,
+    city: json.properties.relativeLocation.properties.city,
+    state: json.properties.relativeLocation.properties.state,
+  };
+  cache.set(key, result);
+  return result;
+}
+
+async function buildWeatherDigest(forecastUrl, city) {
+  const forecastRes = await fetch(forecastUrl);
+  if (!forecastRes.ok) throw new Error(`NWS forecast API ${forecastRes.status}`);
+
+  const forecastJson = await forecastRes.json();
+  const periods = forecastJson.properties.periods;
+  const rainyPeriods = periods.filter((p) => (p.probabilityOfPrecipitation?.value ?? 0) > 30);
+
+  if (rainyPeriods.length > 0) {
+    const names = rainyPeriods.slice(0, 3).map((p) => p.name);
+    const dayStr = names.length === 1 ? names[0] : names.slice(0, -1).join(', ') + ' & ' + names[names.length - 1];
+    return {
+      title: `Rain in the ${city} forecast`,
+      body: `Rain is expected ${dayStr}. Your local inlets may need attention soon.`,
+    };
+  }
+
+  return {
+    title: `Dry week ahead in ${city}`,
+    body: 'No significant rain expected for the next 7 days. A great time to explore Cleanlet!',
+  };
+}
+
+async function runWeatherDigest() {
+  console.log('[sendWeatherDigest] Starting re-engagement digest...');
+
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - DIGEST_INACTIVE_DAYS);
+    const usersSnap = await db.collection('users').where('appLastUsed', '<=', Timestamp.fromDate(cutoff)).get();
+
+    if (usersSnap.empty) {
+      console.log('[sendWeatherDigest] No inactive users found, skipping.');
+      return;
+    }
+
+    const nwsCache = new Map();
+    const cityMap = new Map();
+
+    for (const userDoc of usersSnap.docs) {
+      const user = userDoc.data();
+      if (!user.tokens || user.tokens.length === 0) continue;
+
+      const userId = userDoc.id;
+      const inletsSnap = await db.collection('inlets').where('subscribed', 'array-contains', userId).get();
+      if (inletsSnap.empty) continue;
+
+      for (const inletDoc of inletsSnap.docs) {
+        const { geoLocation } = inletDoc.data();
+        if (!geoLocation) continue;
+
+        let nwsPoint;
+        try {
+          nwsPoint = await resolveNwsPoint(geoLocation.latitude, geoLocation.longitude, nwsCache);
+        } catch (err) {
+          console.error(`[sendWeatherDigest] ${err.message}`);
+          continue;
+        }
+
+        const { city, forecastUrl } = nwsPoint;
+        if (!cityMap.has(city)) {
+          cityMap.set(city, { forecastUrl, userTokens: new Map() });
+        }
+        cityMap.get(city).userTokens.set(userId, user.tokens);
+      }
+    }
+
+    if (cityMap.size === 0) {
+      console.log('[sendWeatherDigest] No city data resolved, skipping.');
+      return;
+    }
+
+    for (const [city, { forecastUrl, userTokens }] of cityMap) {
+      let digest;
+      try {
+        digest = await buildWeatherDigest(forecastUrl, city);
+      } catch (err) {
+        console.error(`[sendWeatherDigest] Failed to build digest for ${city}: ${err.message}`);
+        continue;
+      }
+
+      const tokens = [...userTokens.values()].flat();
+      await schedulePushNotifications(db, { tokens, title: digest.title, body: digest.body });
+      console.log(`[sendWeatherDigest] Scheduled ${city} digest for ${tokens.length} tokens.`);
+    }
+
+    console.log(`[sendWeatherDigest] Done. Processed ${cityMap.size} city/cities.`);
+  } catch (err) {
+    console.error(`[sendWeatherDigest] Fatal error: ${err.message}`);
+  }
+}
+
+export const sendWeatherDigest = onSchedule(
+  {
+    schedule: '0 8 * * *',
+    timeZone: 'America/New_York',
+    region: 'us-east4',
+    nodeVersion: '20',
+  },
+  async () => {
+    await runWeatherDigest();
+    return null;
+  },
+);
+
+export const triggerWeatherDigest = onRequest(
+  {
+    region: 'us-east4',
+    nodeVersion: '20',
+  },
+  async (_req, res) => {
+    await runWeatherDigest();
+    res.send('Weather digest triggered.');
+  },
+);
+
+/*********************************************************
  * Manual Weather Trigger
  *********************************************************/
 export const triggerWeatherStatus = onRequest(
@@ -700,6 +838,54 @@ export const manualNormalizeGeo = onRequest(
       success: true,
       updated: totalUpdated,
     });
+  },
+);
+
+export const backfillGHash = onRequest(
+  {
+    region: 'us-east4',
+    nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '1GiB',
+  },
+  async (_, res) => {
+    const PAGE_SIZE = 500;
+    let lastDoc = null;
+    let totalUpdated = 0;
+
+    while (true) {
+      let query = db.collection('inlets').orderBy('__name__').limit(PAGE_SIZE);
+
+      if (lastDoc) {
+        query = query.startAfter(lastDoc);
+      }
+
+      const snap = await query.get();
+
+      if (snap.empty) break;
+
+      const batch = db.batch();
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        if (data.gHash) continue;
+
+        const geo = data.geoLocation;
+        if (!geo || geo.latitude == null || geo.longitude == null) {
+          console.warn(`Skipping ${doc.id} due to missing geolocation.`);
+          continue;
+        }
+
+        const gHash = geofire.geohashForLocation([geo.latitude, geo.longitude]);
+
+        batch.update(doc.ref, { gHash });
+        totalUpdated++;
+      }
+
+      await batch.commit();
+      lastDoc = snap.docs[snap.docs.length - 1];
+    }
+
+    res.json({ success: true, updated: totalUpdated });
   },
 );
 

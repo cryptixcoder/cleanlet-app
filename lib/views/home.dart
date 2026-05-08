@@ -8,8 +8,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:carousel_slider/carousel_slider.dart';
-import 'package:dots_indicator/dots_indicator.dart';
 
 import '../components/current_inlets_watched.dart';
 import '../models/inlet.dart';
@@ -20,26 +18,37 @@ import 'inlet_view.dart';
 import 'inlet_photo_needed.dart';
 import 'inlet_admin_review.dart';
 
-class HomePage extends StatefulWidget {
+class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
 
   @override
-  State<HomePage> createState() => HomePageState();
+  ConsumerState<HomePage> createState() => _HomePageState();
 }
 
-class HomePageState extends State<HomePage> {
+class _HomePageState extends ConsumerState<HomePage> {
   FirebaseMessaging messaging = FirebaseMessaging.instance;
-  List<Marker> mapMarkers = [];
+
   final List<String> messages = ["Hi and welcome to Cleanlet! Thank you for supporting this project! Here are a few things that you should know:", "Be safe: Always follow the cleaning guidelines and clean only when it feels safe to you. You can find the guidelines in the (?) section of the app.", "Feel free to let us know of any bugs or feedback using the button in the top right menu.", "Read the instructions on how to use the app in the (?) section."];
 
-  double _getMarkerColor(String inletStatus) {
+  GoogleMapController? _mapController;
+  Timer? _debounce;
+  double _currentZoom = 19.0;
+  final Map<String, Marker> _markerCache = {};
+  final Map<String, String?> _markerStatusCache = {};
+
+  // Pre-created once — reused for every marker build.
+  final BitmapDescriptor _iconGreen = BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen);
+  final BitmapDescriptor _iconRed = BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
+  final BitmapDescriptor _iconOrange = BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange);
+
+  BitmapDescriptor _getMarkerIcon(String inletStatus) {
     switch (inletStatus) {
       case 'ready':
-        return BitmapDescriptor.hueGreen;
+        return _iconGreen;
       case 'photo_needed':
-        return BitmapDescriptor.hueRed;
+        return _iconRed;
       default:
-        return BitmapDescriptor.hueOrange; // default color
+        return _iconOrange;
     }
   }
 
@@ -60,16 +69,14 @@ class HomePageState extends State<HomePage> {
   Future<bool> checkFirstSeen() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
     bool seen = (prefs.getBool('seen') ?? false);
-
     if (!seen) {
       await prefs.setBool('seen', true);
-      return true; // return true when the dialog needs to be shown
+      return true;
     }
-    return false; // return false when the dialog doesn't need to be shown
+    return false;
   }
 
   void registerNotification() async {
-    // 3. On iOS, this helps to take the user permissions
     NotificationSettings settings = await messaging.requestPermission(
       alert: true,
       badge: true,
@@ -110,7 +117,6 @@ class HomePageState extends State<HomePage> {
       if (kDebugMode) {
         print('User granted permission');
       }
-      // TODO: handle the received notifications
     } else {
       if (kDebugMode) {
         print('User declined or has not accepted permission');
@@ -119,9 +125,7 @@ class HomePageState extends State<HomePage> {
   }
 
   Future<void> saveTokenToDatabase(String token) async {
-    // Assume user is logged in for this example
     String? userId = FirebaseAuth.instance.currentUser?.uid;
-
     if (userId == null) return;
 
     final userDoc = FirebaseFirestore.instance.collection('users').doc(userId);
@@ -129,13 +133,9 @@ class HomePageState extends State<HomePage> {
     bool success = await updateUserToken(userDoc, token);
 
     if (!success) {
-      await Future.delayed(Duration(seconds: 5));
+      await Future.delayed(const Duration(seconds: 5));
       await updateUserToken(userDoc, token);
     }
-
-    // await FirebaseFirestore.instance.collection('users').doc(userId).update({
-    //   'tokens': FieldValue.arrayUnion([token]),
-    // });
   }
 
   Future<bool> updateUserToken(DocumentReference userDoc, String token) async {
@@ -146,7 +146,6 @@ class HomePageState extends State<HomePage> {
         await userDoc.update({
           'tokens': FieldValue.arrayUnion([token]),
         });
-
         return true;
       } else {
         return false;
@@ -160,17 +159,10 @@ class HomePageState extends State<HomePage> {
   }
 
   Future<void> setupToken() async {
-    // Get the token each time the application loads
     String? token = await FirebaseMessaging.instance.getToken();
-
-    // Save the initial token to the database
     await saveTokenToDatabase(token!);
-
-    // Any time the token refreshes, store this in the database too.
     FirebaseMessaging.instance.onTokenRefresh.listen(saveTokenToDatabase);
   }
-
-  final Completer<GoogleMapController> _controller = Completer<GoogleMapController>();
 
   @override
   void initState() {
@@ -179,63 +171,102 @@ class HomePageState extends State<HomePage> {
     setupToken();
   }
 
-  Future<void> updateMapMarkers(List<Inlet> inlets) async {
-    mapMarkers = inlets
-        .map((inlet) => Marker(
-            markerId: MarkerId(inlet.referenceId),
-            position: LatLng(inlet.geoLocation.latitude, inlet.geoLocation.longitude),
-            infoWindow: InfoWindow(
-              title: inlet.nickName,
-              snippet: inlet.referenceId,
-            )))
-        .toList();
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _mapController?.dispose();
+    super.dispose();
+  }
 
-    setState(() {
-      mapMarkers = mapMarkers;
+  void _onCameraMove(CameraPosition position) {
+    _currentZoom = position.zoom;
+  }
+
+  void _onCameraIdle() {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 250), () async {
+      if (_mapController == null) return;
+      final bounds = await _mapController!.getVisibleRegion();
+      await ref.read(viewportMapProvider.notifier).updateViewport(bounds, _currentZoom);
     });
+  }
+
+  void _applyViewportInlets(List<Inlet> inlets) {
+    final incoming = {for (final i in inlets) i.referenceId: i};
+    bool changed = false;
+
+    // Remove markers that left the viewport.
+    _markerCache.removeWhere((id, _) {
+      if (!incoming.containsKey(id)) {
+        _markerStatusCache.remove(id);
+        changed = true;
+        return true;
+      }
+      return false;
+    });
+
+    // Add or rebuild only markers whose status changed.
+    for (final inlet in inlets) {
+      if (_markerStatusCache[inlet.referenceId] == inlet.inletStatus && _markerCache.containsKey(inlet.referenceId)) {
+        continue;
+      }
+      _markerCache[inlet.referenceId] = Marker(
+        markerId: MarkerId(inlet.referenceId),
+        position: LatLng(inlet.geoLocation.latitude, inlet.geoLocation.longitude),
+        icon: _getMarkerIcon(inlet.inletStatus ?? 'unknown'),
+        onTap: () => _navigateToInletPage(context, inlet),
+      );
+      _markerStatusCache[inlet.referenceId] = inlet.inletStatus;
+      changed = true;
+    }
+
+    if (changed) setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<AsyncValue<List<Inlet>>>(
+      viewportMapProvider,
+      (_, next) => next.whenData(_applyViewportInlets),
+    );
+
     return Scaffold(
       appBar: AppBar(
         title: Consumer(
           builder: (context, ref, child) {
             final user = ref.watch(userProvider);
             return user.when(
-                data: (user) {
-                  // create a string to display the user's name or email address display email if user's display name is null or blank
-                  String textToDisplay = (user.displayName != null && user.displayName!.isNotEmpty) ? user.displayName! : user.email;
-
-                  return Text(textToDisplay);
-                },
-                loading: () => const CircularProgressIndicator(),
-                error: (err, stack) => const Text('Error'));
+              data: (user) {
+                final text = (user.displayName != null && user.displayName!.isNotEmpty) ? user.displayName! : user.email;
+                return Text(text);
+              },
+              loading: () => const CircularProgressIndicator(),
+              error: (err, stack) => const Text('Error'),
+            );
           },
         ),
         leading: Consumer(
           builder: (context, ref, child) {
             final user = ref.watch(userProvider);
             return user.when(
-                data: (user) {
-                  // if user has a photoURL, display it in a CircleAvatar else display a generic person icon
-                  return user.photoURL != null
-                      ? Padding(
-                          padding: const EdgeInsets.all(8.0),
-                          child: CircleAvatar(
-                            backgroundImage: NetworkImage(user.photoURL!),
-                          ),
-                        )
-                      : const Icon(Icons.person);
-                },
-                loading: () => const CircularProgressIndicator(),
-                error: (err, stack) => const Text('Error'));
+              data: (user) {
+                return user.photoURL != null
+                    ? Padding(
+                        padding: const EdgeInsets.all(8.0),
+                        child: CircleAvatar(
+                          backgroundImage: NetworkImage(user.photoURL!),
+                        ),
+                      )
+                    : const Icon(Icons.person);
+              },
+              loading: () => const CircularProgressIndicator(),
+              error: (err, stack) => const Text('Error'),
+            );
           },
         ),
         actions: [
           IconButton(
               onPressed: () {
-                // Navigator.pushNamed(context, '/inletSearch');
                 showDialog(
                     context: context,
                     builder: (BuildContext context) {
@@ -251,70 +282,53 @@ class HomePageState extends State<HomePage> {
         ],
       ),
       bottomNavigationBar: BottomAppBar(
-        //set color to the theme's primary color
         color: Theme.of(context).colorScheme.primary,
-        //center text
         child: const Padding(
           padding: EdgeInsets.all(10.0),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               CurrentInletsWatched(),
-              // question mark icon button make it white
             ],
           ),
         ),
       ),
-      body: SafeArea(
-        child: Consumer(builder: (context, ref, child) {
-          final position = ref.watch(positionProvider);
-          final List<Marker> mapMarkers = [];
-          return position.when(
-              data: (currentPosition) {
-                final inletsAsyncValue = ref.watch(inletsStreamProvider);
-                if (inletsAsyncValue.value != null) {
-                  mapMarkers.addAll(inletsAsyncValue.value!
-                      .map((inlet) => Marker(
-                            onTap: () {
-                              _navigateToInletPage(context, inlet);
-                            },
-                            markerId: MarkerId(inlet.referenceId),
-                            position: LatLng(inlet.geoLocation.latitude, inlet.geoLocation.longitude),
-                            icon: BitmapDescriptor.defaultMarkerWithHue(_getMarkerColor(inlet.inletStatus ?? 'unknown')),
-                          ))
-                      .toList());
-                }
-                return SizedBox(
-                  child: GoogleMap(
-                    mapType: MapType.normal,
-                    initialCameraPosition: CameraPosition(target: LatLng(currentPosition.latitude, currentPosition.longitude), zoom: 19),
-                    onMapCreated: (GoogleMapController controller) async {
-                      _controller.complete(controller);
-
-                      if (await checkFirstSeen()) {
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          // showCarouselModal(context); // Call the function to show the carousel modal
-
-                          showDialog(
-                              context: context,
-                              builder: (BuildContext context) {
-                                return CarouselModalWidget(messages: messages);
-                              });
-                        });
-                      }
-                    },
-
-                    markers: mapMarkers.toSet(),
-                    // zoomControlsEnabled: false,
-                    myLocationEnabled: true,
-                    myLocationButtonEnabled: true,
-                  ),
-                );
-              },
-              error: (error, stack) => Text('Error: ${error.toString()}'),
-              loading: () => const Text('Loading...'));
-        }),
-      ),
+      body: SafeArea(child: _buildMap()),
     );
+  }
+
+  Widget _buildMap() {
+    return Consumer(builder: (context, ref, _) {
+      final position = ref.watch(positionProvider);
+      return position.when(
+        data: (currentPosition) => GoogleMap(
+          mapType: MapType.normal,
+          initialCameraPosition: CameraPosition(
+            target: LatLng(currentPosition.latitude, currentPosition.longitude),
+            zoom: _currentZoom,
+          ),
+          onMapCreated: (GoogleMapController controller) async {
+            _mapController = controller;
+            if (await checkFirstSeen()) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                showDialog(
+                    context: context,
+                    builder: (BuildContext context) {
+                      return CarouselModalWidget(messages: messages);
+                    });
+              });
+            }
+            _onCameraIdle();
+          },
+          onCameraMove: _onCameraMove,
+          onCameraIdle: _onCameraIdle,
+          markers: _markerCache.values.toSet(),
+          myLocationEnabled: true,
+          myLocationButtonEnabled: true,
+        ),
+        error: (error, stack) => Text('Error: ${error.toString()}'),
+        loading: () => const Text('Loading...'),
+      );
+    });
   }
 }
