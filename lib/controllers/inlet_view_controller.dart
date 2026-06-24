@@ -64,7 +64,6 @@ class InletViewController extends AutoDisposeAsyncNotifier<void> {
   }
 
   Future<void> addInletSubscription(Inlet inlet, CleanletUser user) async {
-    print(user.uid);
     final database = ref.read(databaseProvider);
     await database.updateInlet(inlet.referenceId, data: {
       'subscribed': FieldValue.arrayUnion([user.uid])

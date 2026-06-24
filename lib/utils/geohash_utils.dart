@@ -100,7 +100,12 @@ class GeohashUtils {
   }
 
   static int precisionForZoom(double zoom) {
-    if (zoom >= 15) return 5;
+    // Higher zoom -> finer geohash cells, so we only query/load inlets near
+    // what the user can actually see. At the map's default zoom (~19) a
+    // precision-5 cell (~5 km) loaded a whole region's worth of inlets at once.
+    if (zoom >= 17) return 7; // ~150 m cells (street level)
+    if (zoom >= 15) return 6; // ~1.2 km
+    if (zoom >= 13) return 5;
     if (zoom >= 12) return 4;
     return 3;
   }

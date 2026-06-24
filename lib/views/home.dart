@@ -36,6 +36,10 @@ class _HomePageState extends ConsumerState<HomePage> {
   final Map<String, Marker> _markerCache = {};
   final Map<String, String?> _markerStatusCache = {};
 
+  // Snapshot of the marker set handed to GoogleMap. Rebuilt only when markers
+  // actually change (in _applyViewportInlets), not on every widget rebuild.
+  Set<Marker> _markers = {};
+
   // Pre-created once — reused for every marker build.
   final BitmapDescriptor _iconGreen = BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen);
   final BitmapDescriptor _iconRed = BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed);
@@ -220,7 +224,10 @@ class _HomePageState extends ConsumerState<HomePage> {
       changed = true;
     }
 
-    if (changed) setState(() {});
+    if (changed) {
+      _markers = _markerCache.values.toSet();
+      setState(() {});
+    }
   }
 
   @override
@@ -229,6 +236,8 @@ class _HomePageState extends ConsumerState<HomePage> {
       viewportMapProvider,
       (_, next) => next.whenData(_applyViewportInlets),
     );
+
+    final isLoadingInlets = ref.watch(viewportMapProvider).isLoading;
 
     return Scaffold(
       appBar: AppBar(
@@ -293,7 +302,14 @@ class _HomePageState extends ConsumerState<HomePage> {
           ),
         ),
       ),
-      body: SafeArea(child: _buildMap()),
+      body: SafeArea(
+        child: Stack(
+          children: [
+            _buildMap(),
+            if (isLoadingInlets) const _LoadingInletsIndicator(),
+          ],
+        ),
+      ),
     );
   }
 
@@ -322,7 +338,7 @@ class _HomePageState extends ConsumerState<HomePage> {
           },
           onCameraMove: _onCameraMove,
           onCameraIdle: _onCameraIdle,
-          markers: _markerCache.values.toSet(),
+          markers: _markers,
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
         ),
@@ -330,5 +346,40 @@ class _HomePageState extends ConsumerState<HomePage> {
         loading: () => const Text('Loading...'),
       );
     });
+  }
+}
+
+/// Centered, non-interactive overlay shown while a viewport inlet load is in
+/// progress, so the map doesn't appear frozen. Wrapped in IgnorePointer so the
+/// user can keep panning the map underneath while inlets load.
+class _LoadingInletsIndicator extends StatelessWidget {
+  const _LoadingInletsIndicator();
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Center(
+        child: Material(
+          elevation: 4,
+          borderRadius: BorderRadius.circular(24),
+          color: Theme.of(context).colorScheme.surface,
+          child: const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                SizedBox(width: 12),
+                Text('Loading Inlets'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }

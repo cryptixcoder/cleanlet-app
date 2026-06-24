@@ -1,5 +1,4 @@
 import 'package:cleanlet/services/firestore_repository.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -25,6 +24,14 @@ class _UploadPhotoState extends ConsumerState<UploadPhoto> {
   final _addressController = TextEditingController();
   final _descriptionController = TextEditingController();
 
+  bool _isUploading = false;
+  double _uploadProgress = 0;
+
+  // Inlet photos are shown in a small carousel, so a moderate downscale keeps
+  // uploads fast with no visible quality loss.
+  static const _maxImageWidth = 1920.0;
+  static const _imageQuality = 80;
+
   @override
   void dispose() {
     _addressController.dispose();
@@ -33,12 +40,66 @@ class _UploadPhotoState extends ConsumerState<UploadPhoto> {
   }
 
   Future<void> _openImagePicker(ImageSource source) async {
-    final XFile? pickedImage = await _picker.pickImage(source: source);
+    final XFile? pickedImage = await _picker.pickImage(
+      source: source,
+      maxWidth: _maxImageWidth,
+      imageQuality: _imageQuality,
+    );
 
     if (pickedImage != null) {
       setState(() {
         _image = File(pickedImage.path);
       });
+    }
+  }
+
+  Future<void> _uploadPhoto() async {
+    if (!(_formKey.currentState?.validate() ?? false) || _image == null) return;
+
+    setState(() {
+      _isUploading = true;
+      _uploadProgress = 0;
+    });
+
+    try {
+      final filename = '${widget.inlet.referenceId}.jpg';
+      final uploadRef = storageRef.child('inlet-photos').child(filename);
+
+      final task = uploadRef.putFile(
+        _image!,
+        SettableMetadata(
+          contentType: 'image/jpeg',
+          cacheControl: 'public, max-age=31536000',
+        ),
+      );
+
+      task.snapshotEvents.listen((snapshot) {
+        if (snapshot.totalBytes > 0 && mounted) {
+          setState(() {
+            _uploadProgress = snapshot.bytesTransferred / snapshot.totalBytes;
+          });
+        }
+      });
+
+      await task;
+
+      final database = ref.read(databaseProvider);
+      await database.updateInlet(widget.inlet.referenceId, data: {
+        "images": [filename],
+        "inletStatus": "review",
+        "address": _addressController.text.trim(),
+        "description": _descriptionController.text.trim(),
+      });
+
+      if (!mounted) return;
+      await _showMyDialog();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Upload failed. Please try again.')),
+      );
+    } finally {
+      if (mounted) setState(() => _isUploading = false);
     }
   }
 
@@ -69,9 +130,6 @@ class _UploadPhotoState extends ConsumerState<UploadPhoto> {
 
   @override
   Widget build(BuildContext context) {
-    final imagesRef = storageRef.child('inlet-photos');
-    final imageRef = imagesRef.child('${Timestamp.now().toDate().toString()}-${widget.inlet.referenceId}.jpg');
-
     return Scaffold(
         appBar: AppBar(title: Text('Upload Photo')),
         body: SafeArea(
@@ -145,25 +203,24 @@ class _UploadPhotoState extends ConsumerState<UploadPhoto> {
                                           FocusScope.of(context).unfocus(); // dismisses the keyboard
                                         })),
                                 const Spacer(),
+                                if (_isUploading)
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10.0),
+                                    child: LinearProgressIndicator(value: _uploadProgress),
+                                  ),
                                 Container(
                                     margin: const EdgeInsets.symmetric(horizontal: 10.0),
                                     padding: const EdgeInsets.only(top: 20.0),
                                     child: ElevatedButton.icon(
-                                      onPressed: _image == null
-                                          ? null
-                                          : () async {
-                                              if (_formKey.currentState!.validate()) {
-                                                String filename = '${widget.inlet.referenceId}.jpg';
-                                                await imagesRef.child(filename).putFile(_image!);
-                                                final database = ref.read(databaseProvider);
-                                                List<String> photos = [filename];
-
-                                                await database.updateInlet(widget.inlet.referenceId, data: {"images": photos, "inletStatus": "review", "address": _addressController.text.trim(), "description": _descriptionController.text.trim()});
-                                                _showMyDialog();
-                                              }
-                                            },
-                                      icon: const Icon(Icons.check),
-                                      label: const Text("Upload Photo"),
+                                      onPressed: (_image == null || _isUploading) ? null : _uploadPhoto,
+                                      icon: _isUploading
+                                          ? const SizedBox(
+                                              width: 18,
+                                              height: 18,
+                                              child: CircularProgressIndicator(strokeWidth: 2),
+                                            )
+                                          : const Icon(Icons.check),
+                                      label: Text(_isUploading ? "Uploading..." : "Upload Photo"),
                                       style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(40)),
                                     )),
                               ],

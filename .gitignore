@@ -52,3 +52,4 @@ app.*.map.json
 cleanlet-keystore.jks
 cleanlet-upload-cerificate.pem
 spec
+devnotes

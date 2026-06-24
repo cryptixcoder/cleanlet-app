@@ -24,13 +24,79 @@ class _JobStartPageState extends ConsumerState<CleaningPhotoView> {
   final _picker = ImagePicker();
   final storageRef = FirebaseStorage.instance.ref();
 
+  bool _isUploading = false;
+  double _uploadProgress = 0;
+
+  // Cleaning Before/After photos are reviewed by admins, so keep them sharp:
+  // cap the dimension high and use light compression rather than aggressive
+  // downscaling. Still far smaller than a raw multi-MP camera capture.
+  static const _maxImageWidth = 2560.0;
+  static const _imageQuality = 90;
+
   // Implementing the image picker
   Future<void> _openImagePicker(ImageSource source) async {
-    final XFile? pickedImage = await _picker.pickImage(source: source);
+    final XFile? pickedImage = await _picker.pickImage(
+      source: source,
+      maxWidth: _maxImageWidth,
+      imageQuality: _imageQuality,
+    );
     if (pickedImage != null) {
       setState(() {
         _image = File(pickedImage.path);
       });
+    }
+  }
+
+  Future<void> _uploadPhoto() async {
+    if (_image == null) return;
+
+    setState(() {
+      _isUploading = true;
+      _uploadProgress = 0;
+    });
+
+    try {
+      final uploadRef = storageRef
+          .child('cleaning-images')
+          .child(widget.inlet.jobId)
+          .child('${widget.photoToTake}.jpg');
+
+      final task = uploadRef.putFile(
+        _image!,
+        SettableMetadata(
+          contentType: 'image/jpeg',
+          cacheControl: 'public, max-age=31536000',
+        ),
+      );
+
+      task.snapshotEvents.listen((snapshot) {
+        if (snapshot.totalBytes > 0 && mounted) {
+          setState(() {
+            _uploadProgress = snapshot.bytesTransferred / snapshot.totalBytes;
+          });
+        }
+      });
+
+      await task;
+
+      if (widget.photoToTake == 'Before') {
+        // Mark the job so a returning user is routed to the After screen.
+        await _addBeforePhotoUploadedMarker(ref);
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (context) => TestPage(widget.inlet)),
+        );
+      } else if (widget.photoToTake == 'After') {
+        await _completeJob(ref);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Upload failed. Please try again.')),
+      );
+    } finally {
+      if (mounted) setState(() => _isUploading = false);
     }
   }
 
@@ -76,9 +142,6 @@ class _JobStartPageState extends ConsumerState<CleaningPhotoView> {
 
   @override
   Widget build(BuildContext context) {
-    final imagesRef = storageRef.child('cleaning-images');
-    final imageRef = imagesRef.child(widget.inlet.jobId).child('${widget.photoToTake}.jpg');
-
     return Scaffold(
       appBar: AppBar(
         title: Text('${widget.photoToTake} Cleaning Photo'),
@@ -127,26 +190,21 @@ class _JobStartPageState extends ConsumerState<CleaningPhotoView> {
                 ),
               ),
               const Spacer(),
+              if (_isUploading)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20.0),
+                  child: LinearProgressIndicator(value: _uploadProgress),
+                ),
               ElevatedButton.icon(
-                onPressed: _image == null
-                    ? null
-                    : () async {
-                        await imageRef.putFile(_image!);
-                        // You can add more code here
-                        if (widget.photoToTake == 'Before') {
-                          // Add an indicator to the job so that if the user closes the app and comes back to it we can check and redirect them to the after screen
-                          await _addBeforePhotoUploadedMarker(ref);
-
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(builder: (context) => TestPage(widget.inlet)),
-                          );
-                        } else if (widget.photoToTake == 'After') {
-                          await _completeJob(ref);
-                        }
-                      },
-                icon: const Icon(Icons.check),
-                label: const Text("Complete"),
+                onPressed: (_image == null || _isUploading) ? null : _uploadPhoto,
+                icon: _isUploading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.check),
+                label: Text(_isUploading ? "Uploading..." : "Complete"),
                 style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(40)),
               )
             ],

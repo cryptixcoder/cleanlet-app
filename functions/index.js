@@ -689,7 +689,7 @@ async function createInletCleaningJob(inletId, risk) {
 }
 
 export const MM_PER_INCH = 25.4;
-export const RAIN_THRESHOLD_MM = 0.75 * MM_PER_INCH;
+export const RAIN_THRESHOLD_MM = 0.5 * MM_PER_INCH;
 
 const parseValidTime = (validTime) => {
   const [startStr, durationStr] = validTime.split('/');
@@ -982,6 +982,7 @@ export const processImports = onDocumentWritten(
             const lat = Number(row.latitude);
             const lng = Number(row.longitude);
             const geohash = normalizeGeo(lat, lng);
+            const gHash = geofire.geohashForLocation([lat, lng]);
 
             const existingSnap = await inletRef
               .where('nickName', '==', row.name)
@@ -1007,6 +1008,7 @@ export const processImports = onDocumentWritten(
 
               const updatePayload = {
                 images: finalImages,
+                gHash,
               };
 
               if (!existingData.address && finalAddress) {
@@ -1026,6 +1028,7 @@ export const processImports = onDocumentWritten(
                 images: images,
                 geoLocation: new GeoPoint(Number(row.latitude), Number(row.longitude)),
                 geoHash: geohash,
+                gHash,
                 inletStatus: row?.address.trim() && images.length > 0 ? 'ready' : 'photo_needed',
               });
             }

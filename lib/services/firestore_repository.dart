@@ -17,6 +17,9 @@ class FirestoreRepository {
 
   final FirestoreDataSource _dataSource;
 
+  // WARNING: streams the ENTIRE `inlets` collection unbounded and re-emits on
+  // every change. Do NOT use this in the UI — it will load every inlet in the
+  // database. Use `viewportMapProvider` / `fetchInletsInBounds` instead.
   Stream<List<Inlet>> watchInlets() => _dataSource.watchCollection(
         path: 'inlets',
         builder: (data, documentId) => Inlet.fromMap(data, documentId),
@@ -74,7 +77,14 @@ class FirestoreRepository {
       }
     }
 
-    return results;
+    // Geohash cells extend beyond the visible viewport, so restrict the
+    // returned inlets to what's actually on screen. This keeps the marker
+    // count tied to what the user sees rather than the (larger) query region.
+    return results
+        .where((inlet) => bounds.contains(
+              LatLng(inlet.geoLocation.latitude, inlet.geoLocation.longitude),
+            ))
+        .toList();
   }
 
   Stream<Inlet> watchInlet({required InletID inletID}) =>
@@ -118,6 +128,9 @@ final databaseProvider = Provider<FirestoreRepository>((ref) {
   return FirestoreRepository(ref.watch(firestoreDataSourceProvider));
 });
 
+// WARNING: do NOT consume this in the UI. It streams the entire `inlets`
+// collection unbounded (see watchInlets above). The map uses
+// `viewportMapProvider` for bounded, viewport-scoped loading instead.
 final inletsStreamProvider = StreamProvider.autoDispose<List<Inlet>>((ref) {
   final database = ref.watch(databaseProvider);
   return database.watchInlets();

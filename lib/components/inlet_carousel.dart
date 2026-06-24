@@ -1,3 +1,5 @@
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_carousel_widget/flutter_carousel_widget.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -35,15 +37,19 @@ class InletCarousel extends StatelessWidget {
             items: imageUrls.map((imageUrl) {
               return Builder(
                 builder: (BuildContext context) {
-                  return Container(
-                    width: MediaQuery.of(context).size.width,
-                    height: 100,
-                    decoration: BoxDecoration(
-                      image: DecorationImage(
-                        fit: BoxFit.cover,
-                        image: NetworkImage(imageUrl),
-                      ),
-                    ),
+                  final width = MediaQuery.of(context).size.width;
+                  final dpr = MediaQuery.of(context).devicePixelRatio;
+                  return CachedNetworkImage(
+                    imageUrl: imageUrl,
+                    fit: BoxFit.cover,
+                    width: width,
+                    // Decode to display size to cap memory; disk cache makes
+                    // revisits load instantly instead of re-downloading.
+                    memCacheWidth: (width * dpr).round(),
+                    placeholder: (context, url) =>
+                        const Center(child: CircularProgressIndicator()),
+                    errorWidget: (context, url, error) =>
+                        const Center(child: Icon(Icons.broken_image)),
                   );
                 },
               );
@@ -82,7 +88,9 @@ class InletCarousel extends StatelessWidget {
         return [];
       }
     } catch (e) {
-      print('Error fetching data: $e');
+      if (kDebugMode) {
+        print('Error fetching data: $e');
+      }
       return [];
     }
   }

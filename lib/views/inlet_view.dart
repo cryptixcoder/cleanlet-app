@@ -1,17 +1,14 @@
 import 'package:cleanlet/utils/async_value_ui.dart';
 import 'package:cleanlet/views/job_start.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:map_launcher/map_launcher.dart';
 
 import '../components/current_inlets_watched.dart';
-import '../components/image_carousel.dart';
 import '../components/inlet_carousel.dart';
 import '../components/inlet_intro.dart';
 import '../controllers/inlet_view_controller.dart';
 import '../models/inlet.dart';
-import '../models/job.dart';
 import '../services/firestore_repository.dart';
 
 class InletView extends StatelessWidget {
@@ -172,7 +169,6 @@ class ShowButton extends ConsumerWidget {
     String jobId = inlet.jobId;
 
     if (inlet.status == 'cleaningScheduled' && inlet.isSubscribed) {
-      print('status is cleaningScheduled');
       return VolunteerButton(jobId, inlet.referenceId);
     } else if (inlet.status == 'accepted' && inlet.isSubscribed) {
       return StartButton(inlet);
