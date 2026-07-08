@@ -447,6 +447,12 @@ export const inletStatusUpdatedV2 = onDocumentUpdated(
 
     await createInletCleaningJob(event.params.inletId, newValue.risk);
 
+    // Stamp the 48h debounce timestamp immediately after the job is created,
+    // BEFORE gathering tokens / scheduling the push. If anything below fails,
+    // the debounce is still recorded so the next weather update can't create a
+    // duplicate cleaning job for the same inlet.
+    await db.collection('inlets').doc(event.params.inletId).update({ lastNotificationAndCleaningJobCreated: now });
+
     let tokens = [];
 
     for (const userId of newValue.subscribed ?? []) {
@@ -456,54 +462,11 @@ export const inletStatusUpdatedV2 = onDocumentUpdated(
       }
     }
 
-    await schedulePushNotification(db, {
+    await schedulePushNotifications(db, {
       tokens,
       title: 'Inlet Cleaning Needed',
       body: oldValue?.address ? `The Inlet at ${oldValue.address} needs cleaning.` : 'An Inlet you follow requires cleaning.',
     });
-
-    await db.collection('inlets').doc(event.params.inletId).update({ lastNotificationAndCleaningJobCreated: now });
-
-    // if (!lastNotification || now.toDate().getTime() - lastNotification.toDate().getTime() >= 48 * 60 * 60 * 1000) {
-    //   if (oldValue.risk !== newValue.risk && newValue.risk > 35) {
-    //     console.log('High risk detected, creating cleaning job...');
-    //     await createInletCleaningJob(event.params.inletId, newValue.risk);
-
-    //     let tokens = [];
-
-    //     for (const userId of newValue.subscribed ?? []) {
-    //       const userDoc = await db.collection('users').doc(userId).get();
-    //       if (userDoc.exists && userDoc.data().tokens) {
-    //         tokens.push(...userDoc.data().tokens);
-    //       }
-    //     }
-
-    //     await schedulePushNotification(db, {
-    //       tokens,
-    //       title: 'Inlet Cleaning Needed',
-    //       body: oldValue?.address ? `The Inlet at ${oldValue.address} needs cleaning.` : 'An Inlet you follow requires cleaning.',
-    //     });
-
-    //     if (tokens.length > 0) {
-    //       const message = {
-    //         tokens,
-    //         notification: {
-    //           title: 'Inlet Cleaning Needed',
-    //           body: oldValue?.address ? `The Inlet at ${oldValue.address} needs cleaning.` : 'An Inlet you follow requires cleaning.',
-    //         },
-    //         android: { priority: 'high' },
-    //       };
-
-    //       const response = await messaging.sendEachForMulticast(message);
-    //       response.responses.forEach((r, i) => {
-    //         if (r.success) console.log(`Message to ${tokens[i]} succeeded`);
-    //         else console.error(`Message failed: ${r.error?.message}`);
-    //       });
-    //     }
-
-    //     await db.collection('inlets').doc(event.params.inletId).update({ lastNotificationAndCleaningJobCreated: now });
-    //   }
-    // }
   },
 );
 
@@ -725,7 +688,7 @@ export const sumPrecipitationMM = (values, windowStart, windowEnd) => {
  *********************************************************/
 async function checkWeatherStatus() {
   console.log('Checking weather status...');
-  const inlets = await db.collection('inlets').get();
+  const inlets = await db.collection('inlets').where('inletStatus', '==', 'ready').get();
 
   const now = new Date();
   const window24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
@@ -770,15 +733,16 @@ async function checkWeatherStatus() {
       weatherCheckedAt: FieldValue.serverTimestamp(),
     });
 
-    if (inlet.inletStatus === 'ready') {
-      await db.collection('weatherPredictions').add({
-        inletId: doc.id,
-        risk,
-        rainNext48Inches: Number(rainNext48Inches.toFixed(2)),
-        heavyRainExpected,
-        createdAt: FieldValue.serverTimestamp(),
-      });
-    }
+    // TODO: For now, I've commented out this code to reduce data usage since we aren't displaying weather predictions yet
+    // if (inlet.inletStatus === 'ready') {
+    //   await db.collection('weatherPredictions').add({
+    //     inletId: doc.id,
+    //     risk,
+    //     rainNext48Inches: Number(rainNext48Inches.toFixed(2)),
+    //     heavyRainExpected,
+    //     createdAt: FieldValue.serverTimestamp(),
+    //   });
+    // }
   }
 }
 
