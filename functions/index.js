@@ -46,9 +46,15 @@ export const createUserDoc = functions.auth.user().onCreate((user) => {
  *********************************************************/
 export const checkWeatherStatusPubSub = onSchedule(
   {
-    schedule: 'every 1 minutes',
+    // Hourly is plenty — NWS 48h forecasts don't change minute-to-minute, and
+    // the previous every-1-minute cadence made ~3 external NWS calls per ready
+    // inlet per minute (thousands/min at scale), blowing past NWS fair-use.
+    schedule: '0 * * * *',
+    timeZone: 'America/New_York',
     region: 'us-east4',
     nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '512MiB',
   },
   async () => {
     await checkWeatherStatus();
@@ -192,6 +198,7 @@ async function resolveNwsPoint(lat, lng, cache) {
   const json = await res.json();
   const result = {
     forecastUrl: json.properties.forecast,
+    gridPointUrl: json.properties.forecastGridData,
     city: json.properties.relativeLocation.properties.city,
     state: json.properties.relativeLocation.properties.state,
   };
@@ -686,64 +693,106 @@ export const sumPrecipitationMM = (values, windowStart, windowEnd) => {
 /*********************************************************
  * Weather Check Function
  *********************************************************/
+const WEATHER_CONCURRENCY = 5;
+
+// Fetch + compute the 48h outlook for one NWS grid point, memoized by the
+// gridpoint URL. Many inlets share a grid cell, so this collapses what used to
+// be 3 NWS calls *per inlet* down to 3 calls *per unique grid cell*.
+async function getWeatherForGridPoint(forecastUrl, gridPointUrl, now, window48h, cache) {
+  if (cache.has(gridPointUrl)) return cache.get(gridPointUrl);
+
+  const forecastRes = await fetch(forecastUrl);
+  if (!forecastRes.ok) throw new Error(`NWS forecast API ${forecastRes.status}`);
+  const forecastJson = await forecastRes.json();
+  const nextPeriod = forecastJson.properties.periods?.[0];
+  const risk = nextPeriod?.probabilityOfPrecipitation?.value || 0;
+
+  const gridRes = await fetch(gridPointUrl);
+  if (!gridRes.ok) throw new Error(`NWS gridData API ${gridRes.status}`);
+  const gridJson = await gridRes.json();
+  const quantitativePrecipitation = gridJson.properties.quantitativePrecipitation;
+
+  let rainNext48MM = 0;
+  if (quantitativePrecipitation?.values?.length) {
+    rainNext48MM = sumPrecipitationMM(quantitativePrecipitation.values, now, window48h);
+  }
+
+  const result = {
+    risk,
+    rainNext48Inches: Number((rainNext48MM / MM_PER_INCH).toFixed(2)),
+    heavyRainExpected: rainNext48MM >= RAIN_THRESHOLD_MM,
+  };
+  cache.set(gridPointUrl, result);
+  return result;
+}
+
 async function checkWeatherStatus() {
-  console.log('Checking weather status...');
+  console.log('[checkWeatherStatus] Checking weather status...');
   const inlets = await db.collection('inlets').where('inletStatus', '==', 'ready').get();
 
+  if (inlets.empty) {
+    console.log('[checkWeatherStatus] No ready inlets to check.');
+    return;
+  }
+
   const now = new Date();
-  const window24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
   const window48h = new Date(now.getTime() + 48 * 60 * 60 * 1000);
 
-  for (const doc of inlets.docs) {
-    const inlet = doc.data();
-    const { latitude, longitude } = inlet.geoLocation;
+  // Two memo layers, both scoped to this single run:
+  //  - pointCache: rounded lat/lng -> NWS forecast + gridpoint URLs
+  //  - weatherCache: gridpoint URL -> computed { risk, rainNext48Inches, heavyRainExpected }
+  const pointCache = new Map();
+  const weatherCache = new Map();
 
-    const pointRes = await fetch(`https://api.weather.gov/points/${latitude},${longitude}`);
-    const pointJson = await pointRes.json();
-    const forecastUrl = pointJson.properties.forecast;
-    const gridPointUrl = pointJson.properties.forecastGridData;
+  const limit = pLimit(WEATHER_CONCURRENCY);
+  let updated = 0;
+  let failed = 0;
 
-    const forecastRes = await fetch(forecastUrl);
-    const forecastJson = await forecastRes.json();
-    const periods = forecastJson.properties.periods;
-    const nextPeriod = periods[0];
-    const risk = nextPeriod.probabilityOfPrecipitation?.value || 0;
+  // Each inlet is isolated in its own try/catch so one bad NWS response can't
+  // abort the whole run (the old sequential loop skipped every inlet after the
+  // first failure).
+  await Promise.allSettled(
+    inlets.docs.map((doc) =>
+      limit(async () => {
+        const inlet = doc.data();
+        const geo = inlet.geoLocation;
+        if (!geo || geo.latitude == null || geo.longitude == null) {
+          console.warn(`[checkWeatherStatus] Skipping ${doc.id}: missing geolocation.`);
+          return;
+        }
 
-    const gridPontRes = await fetch(gridPointUrl);
-    const gridPointJson = await gridPontRes.json();
+        try {
+          const { forecastUrl, gridPointUrl } = await resolveNwsPoint(geo.latitude, geo.longitude, pointCache);
+          const weather = await getWeatherForGridPoint(forecastUrl, gridPointUrl, now, window48h, weatherCache);
 
-    const quantitativePrecipitation = gridPointJson.properties.quantitativePrecipitation;
+          await doc.ref.update({
+            risk: weather.risk,
+            rainNext48Inches: weather.rainNext48Inches,
+            heavyRainExpected: weather.heavyRainExpected,
+            weatherCheckedAt: FieldValue.serverTimestamp(),
+          });
+          updated++;
 
-    let rain24to48MM = 0;
-    let rainNext48MM = 0;
+          // TODO: weatherPredictions logging intentionally disabled — we aren't
+          // displaying prediction history yet, and writing one doc per inlet per
+          // run was a large, unread write/storage cost. Re-enable behind a real
+          // reader + a retention/TTL policy.
+          // await db.collection('weatherPredictions').add({
+          //   inletId: doc.id,
+          //   risk: weather.risk,
+          //   rainNext48Inches: weather.rainNext48Inches,
+          //   heavyRainExpected: weather.heavyRainExpected,
+          //   createdAt: FieldValue.serverTimestamp(),
+          // });
+        } catch (err) {
+          failed++;
+          console.error(`[checkWeatherStatus] Inlet ${doc.id} failed: ${err.message}`);
+        }
+      }),
+    ),
+  );
 
-    if (quantitativePrecipitation?.values?.length) {
-      rainNext48MM = sumPrecipitationMM(quantitativePrecipitation.values, now, window48h);
-
-      rain24to48MM = sumPrecipitationMM(quantitativePrecipitation.values, window24h, window48h);
-    }
-
-    const rainNext48Inches = rainNext48MM / MM_PER_INCH;
-    const heavyRainExpected = rainNext48MM >= RAIN_THRESHOLD_MM;
-
-    await doc.ref.update({
-      risk,
-      rainNext48Inches: Number(rainNext48Inches.toFixed(2)),
-      heavyRainExpected,
-      weatherCheckedAt: FieldValue.serverTimestamp(),
-    });
-
-    // TODO: For now, I've commented out this code to reduce data usage since we aren't displaying weather predictions yet
-    // if (inlet.inletStatus === 'ready') {
-    //   await db.collection('weatherPredictions').add({
-    //     inletId: doc.id,
-    //     risk,
-    //     rainNext48Inches: Number(rainNext48Inches.toFixed(2)),
-    //     heavyRainExpected,
-    //     createdAt: FieldValue.serverTimestamp(),
-    //   });
-    // }
-  }
+  console.log(`[checkWeatherStatus] Done. Updated ${updated}, failed ${failed}; ${inlets.size} ready inlets across ${weatherCache.size} unique grid points.`);
 }
 
 const normalizeGeo = (lat, lng) => {
