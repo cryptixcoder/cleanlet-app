@@ -28,6 +28,42 @@ const storage = getStorage(app);
 const bucket = storage.bucket();
 
 /*********************************************************
+ * Geolocation-Grouped Weather — config & feature flag
+ * See devnotes/geolocation-grouping-weather-plan-2026-07-17.md
+ *********************************************************/
+
+// Master switch for the group-based weather path. When true:
+//  - legacy checkWeatherStatusPubSub is skipped (group path owns weather checks)
+//  - inletStatusUpdatedV2's job/notification body no-ops (group path owns jobs/pushes)
+//  - the scheduled checkGroupWeather runs fully (weather + jobs + notifications)
+// When false, everything legacy runs and the group scheduled fns idle; the manual
+// triggers (triggerRebuildGroups / triggerGroupWeather) still work for backfill/shadow.
+const GROUP_WEATHER_ENABLED = true;
+
+// Weather is effectively homogeneous within an NWS grid cell (~2.5 km). 5 km keeps
+// each group inside a single weather regime while minimizing group count.
+export const GROUP_RADIUS_METERS = 5000;
+export const GROUP_WEATHER_CONCURRENCY = 5; // parallel NWS pings across groups
+export const RISK_THRESHOLD = 35; // matches legacy inletStatusUpdatedV2
+export const JOB_DEBOUNCE_MS = 48 * 60 * 60 * 1000;
+// A rebuilt group whose center lands within this distance of an existing group's
+// center reuses that group doc (carrying forward resolved NWS URLs + debounce state),
+// keeping group identity stable day-to-day. 500 m << the 2.5 km NWS cell, so a match
+// is guaranteed to be the same weather cell.
+const GROUP_CENTER_MATCH_METERS = 500;
+
+// Commit an array of items across Firestore batches, chunked under the 500-write cap.
+async function runBatched(items, applyFn, chunkSize = 500) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const batch = db.batch();
+    for (const item of items.slice(i, i + chunkSize)) {
+      applyFn(batch, item);
+    }
+    await batch.commit();
+  }
+}
+
+/*********************************************************
  * User Document Creation on Auth Signup
  *********************************************************/
 export const createUserDoc = functions.auth.user().onCreate((user) => {
@@ -57,6 +93,10 @@ export const checkWeatherStatusPubSub = onSchedule(
     memory: '512MiB',
   },
   async () => {
+    if (GROUP_WEATHER_ENABLED) {
+      console.log('[checkWeatherStatusPubSub] Skipped: GROUP_WEATHER_ENABLED — the group weather path owns weather checks.');
+      return null;
+    }
     await checkWeatherStatus();
     return null;
   },
@@ -431,6 +471,14 @@ export const inletStatusUpdatedV2 = onDocumentUpdated(
     nodeVersion: '20',
   },
   async (event) => {
+    // Phase 1 of retiring this per-inlet trigger: when the group weather path is
+    // live it owns job creation + notifications, so this body must no-op. Otherwise
+    // checkGroupWeather's batched weather fan-out would re-fire a job/push per inlet.
+    if (GROUP_WEATHER_ENABLED) {
+      console.log(`[inletStatusUpdatedV2] No-op for ${event.params.inletId}: GROUP_WEATHER_ENABLED — checkGroupWeather owns jobs/notifications.`);
+      return;
+    }
+
     const newValue = event.data.after.data();
     const oldValue = event.data.before.data();
 
@@ -645,17 +693,30 @@ export const manuallyTriggerCleaningJobNotifications = onRequest(
 /*********************************************************
  * Utility: Create Inlet Cleaning Job
  *********************************************************/
-async function createInletCleaningJob(inletId, risk) {
-  const ref = await db.collection('inletCleaningJobs').add({
+// Shared job-creation primitive so the single-inlet path (legacy trigger) and the
+// batched group fan-out write identical documents. Adds the job + flips the inlet to
+// 'cleaningScheduled' on the provided batch; extraInletUpdates lets the group path also
+// stamp the per-inlet debounce atomically. Returns the new jobId.
+function applyCleaningJobToBatch(batch, inletId, risk, extraInletUpdates = {}) {
+  const jobRef = db.collection('inletCleaningJobs').doc();
+  batch.set(jobRef, {
     inletId,
     createdAt: FieldValue.serverTimestamp(),
     status: 'pending',
     risk,
   });
-  await db.collection('inlets').doc(inletId).update({
-    jobId: ref.id,
+  batch.update(db.collection('inlets').doc(inletId), {
+    jobId: jobRef.id,
     status: 'cleaningScheduled',
+    ...extraInletUpdates,
   });
+  return jobRef.id;
+}
+
+async function createInletCleaningJob(inletId, risk) {
+  const batch = db.batch();
+  applyCleaningJobToBatch(batch, inletId, risk);
+  await batch.commit();
 }
 
 export const MM_PER_INCH = 25.4;
@@ -794,6 +855,345 @@ async function checkWeatherStatus() {
 
   console.log(`[checkWeatherStatus] Done. Updated ${updated}, failed ${failed}; ${inlets.size} ready inlets across ${weatherCache.size} unique grid points.`);
 }
+
+/*********************************************************
+ * Geolocation-Grouped Weather — daily grouping
+ *********************************************************/
+
+// Greedy radius clustering of ready inlets into stable, center+radius groups.
+// Stamps groupId on each inlet and upserts /inletGroups/*. Makes ZERO NWS calls —
+// NWS point resolution is done lazily/persisted by checkGroupWeather.
+async function rebuildGroups() {
+  console.log('[rebuildInletGroups] Starting group rebuild...');
+
+  // Existing groups let us carry forward a stable identity (and thus the already
+  // resolved NWS URLs + debounce state) for centers that barely move run-to-run.
+  const existingSnap = await db.collection('inletGroups').get();
+  const existingGroups = existingSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+  // Greedy pass over ready inlets, ordered by __name__ for day-to-day stability.
+  const groups = []; // { centerLat, centerLng, sumLat, sumLng, count, memberIds }
+  const PAGE_SIZE = 500;
+  let lastDoc = null;
+  let scanned = 0;
+
+  while (true) {
+    let query = db.collection('inlets').where('inletStatus', '==', 'ready').orderBy('__name__').limit(PAGE_SIZE);
+    if (lastDoc) query = query.startAfter(lastDoc);
+
+    const snap = await query.get();
+    if (snap.empty) break;
+
+    for (const doc of snap.docs) {
+      const geo = doc.data().geoLocation;
+      if (!geo || geo.latitude == null || geo.longitude == null) {
+        console.warn(`[rebuildInletGroups] Skipping ${doc.id}: missing geolocation.`);
+        continue;
+      }
+
+      const lat = geo.latitude;
+      const lng = geo.longitude;
+      scanned++;
+
+      // Assign to the first group whose center is within the radius, else start one.
+      // (For multi-region datasets, bucket candidate groups by geohash-5 prefix first
+      //  to keep this near-linear — not needed at single-city scale.)
+      let assigned = null;
+      for (const g of groups) {
+        if (geofire.distanceBetween([lat, lng], [g.centerLat, g.centerLng]) * 1000 <= GROUP_RADIUS_METERS) {
+          assigned = g;
+          break;
+        }
+      }
+
+      if (!assigned) {
+        assigned = { centerLat: lat, centerLng: lng, sumLat: 0, sumLng: 0, count: 0, memberIds: [] };
+        groups.push(assigned);
+      }
+
+      assigned.sumLat += lat;
+      assigned.sumLng += lng;
+      assigned.count += 1;
+      assigned.centerLat = assigned.sumLat / assigned.count;
+      assigned.centerLng = assigned.sumLng / assigned.count;
+      assigned.memberIds.push(doc.id);
+    }
+
+    lastDoc = snap.docs[snap.docs.length - 1];
+    if (snap.size < PAGE_SIZE) break;
+  }
+
+  const now = Timestamp.now();
+  const usedExistingIds = new Set();
+  const groupDocs = []; // { id, memberIds, data }
+
+  for (const g of groups) {
+    // Reuse an existing group doc whose center is within GROUP_CENTER_MATCH_METERS.
+    let matched = null;
+    for (const eg of existingGroups) {
+      if (usedExistingIds.has(eg.id) || !eg.centerGeo) continue;
+      if (geofire.distanceBetween([g.centerLat, g.centerLng], [eg.centerGeo.latitude, eg.centerGeo.longitude]) * 1000 <= GROUP_CENTER_MATCH_METERS) {
+        matched = eg;
+        break;
+      }
+    }
+
+    const id = matched ? matched.id : db.collection('inletGroups').doc().id;
+    if (matched) usedExistingIds.add(matched.id);
+
+    // merge:true preserves NWS URLs, last* weather, and lastJobBatchCreatedAt on
+    // reused docs. New docs start without NWS URLs so checkGroupWeather resolves them.
+    groupDocs.push({
+      id,
+      memberIds: g.memberIds,
+      data: {
+        centerGeo: new GeoPoint(g.centerLat, g.centerLng),
+        centerGeoHash: geofire.geohashForLocation([g.centerLat, g.centerLng]),
+        radiusMeters: GROUP_RADIUS_METERS,
+        inletCount: g.count,
+        rebuiltAt: now,
+      },
+    });
+  }
+
+  // Upsert group docs.
+  await runBatched(groupDocs, (batch, gd) => {
+    batch.set(db.collection('inletGroups').doc(gd.id), gd.data, { merge: true });
+  });
+
+  // Stamp groupId onto every member inlet (chunked across all groups).
+  const memberUpdates = [];
+  for (const gd of groupDocs) {
+    for (const inletId of gd.memberIds) {
+      memberUpdates.push({ inletId, groupId: gd.id });
+    }
+  }
+  await runBatched(memberUpdates, (batch, { inletId, groupId }) => {
+    batch.update(db.collection('inlets').doc(inletId), { groupId, groupAssignedAt: now });
+  });
+
+  // Delete existing groups that ended up with no members this run.
+  const staleIds = existingGroups.filter((eg) => !usedExistingIds.has(eg.id)).map((eg) => eg.id);
+  await runBatched(staleIds, (batch, id) => {
+    batch.delete(db.collection('inletGroups').doc(id));
+  });
+
+  console.log(`[rebuildInletGroups] Done. Scanned ${scanned} ready inlets → ${groupDocs.length} groups (${staleIds.length} stale deleted, ${usedExistingIds.size} reused).`);
+}
+
+export const rebuildInletGroups = onSchedule(
+  {
+    schedule: '0 3 * * *',
+    timeZone: 'America/New_York',
+    region: 'us-east4',
+    nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '1GiB',
+  },
+  async () => {
+    // Safe to run regardless of the flag: grouping is a prerequisite and makes no
+    // NWS calls, so keeping membership fresh before cutover is harmless.
+    await rebuildGroups();
+    return null;
+  },
+);
+
+/*********************************************************
+ * Geolocation-Grouped Weather — hourly ping + fan-out
+ *********************************************************/
+
+// Union + de-duplicate the FCM tokens of every user subscribed to any of the given
+// inlets, so a user following several inlets in one group gets a single push.
+async function collectSubscriberTokens(inletDocs) {
+  const userIds = new Set();
+  for (const doc of inletDocs) {
+    for (const uid of doc.data().subscribed ?? []) userIds.add(uid);
+  }
+
+  const ids = [...userIds];
+  const tokens = new Set();
+  const CHUNK = 300; // getAll fan-in
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const refs = ids.slice(i, i + CHUNK).map((id) => db.collection('users').doc(id));
+    const userDocs = await db.getAll(...refs);
+    for (const ud of userDocs) {
+      if (!ud.exists) continue;
+      for (const t of ud.data().tokens ?? []) tokens.add(t);
+    }
+  }
+
+  return [...tokens];
+}
+
+// One weather ping per group, fanned out to member inlets. With createJobs=false
+// this is a pure shadow run (weather + display writes only, no jobs/pushes).
+async function runGroupWeather({ createJobs = true } = {}) {
+  console.log(`[checkGroupWeather] Starting (createJobs=${createJobs})...`);
+
+  const groupsSnap = await db.collection('inletGroups').get();
+  if (groupsSnap.empty) {
+    console.log('[checkGroupWeather] No groups to check. Run rebuildInletGroups first.');
+    return;
+  }
+
+  const now = new Date();
+  const window48h = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  const nowTs = Timestamp.now();
+
+  // Scoped memos in case two groups happen to share a point/grid cell this run.
+  const pointCache = new Map();
+  const weatherCache = new Map();
+  const limit = pLimit(GROUP_WEATHER_CONCURRENCY);
+
+  const stats = { groups: 0, jobsCreated: 0, pushSubscribers: 0, failures: 0 };
+
+  await Promise.allSettled(
+    groupsSnap.docs.map((groupDoc) =>
+      limit(async () => {
+        const group = groupDoc.data();
+        const geo = group.centerGeo;
+        if (!geo || geo.latitude == null || geo.longitude == null) {
+          console.warn(`[checkGroupWeather] Group ${groupDoc.id} missing centerGeo, skipping.`);
+          return;
+        }
+
+        try {
+          // 1. Resolve the NWS point once and persist it — later runs skip /points.
+          let { nwsForecastUrl: forecastUrl, nwsGridPointUrl: gridPointUrl } = group;
+          if (!forecastUrl || !gridPointUrl) {
+            const resolved = await resolveNwsPoint(geo.latitude, geo.longitude, pointCache);
+            forecastUrl = resolved.forecastUrl;
+            gridPointUrl = resolved.gridPointUrl;
+            await groupDoc.ref.update({
+              nwsForecastUrl: forecastUrl,
+              nwsGridPointUrl: gridPointUrl,
+              nwsResolvedAt: nowTs,
+            });
+          }
+
+          // 2. Fetch weather once for the group.
+          const weather = await getWeatherForGridPoint(forecastUrl, gridPointUrl, now, window48h, weatherCache);
+
+          // 3. Persist group-level weather.
+          await groupDoc.ref.update({
+            lastRisk: weather.risk,
+            lastRainNext48Inches: weather.rainNext48Inches,
+            lastHeavyRainExpected: weather.heavyRainExpected,
+            lastCheckedAt: nowTs,
+          });
+          stats.groups++;
+
+          // 4. Fan out display fields to member inlets (batched, no per-inlet trigger).
+          const membersSnap = await db.collection('inlets').where('groupId', '==', groupDoc.id).get();
+          const memberDocs = membersSnap.docs;
+
+          await runBatched(memberDocs, (batch, m) => {
+            batch.update(m.ref, {
+              risk: weather.risk,
+              rainNext48Inches: weather.rainNext48Inches,
+              heavyRainExpected: weather.heavyRainExpected,
+              weatherCheckedAt: FieldValue.serverTimestamp(),
+            });
+          });
+
+          if (!createJobs) return;
+
+          // 5. Jobs + notifications, gated by a group-level 48h debounce (cheap early out).
+          const groupDebouncePassed = !group.lastJobBatchCreatedAt || nowTs.toMillis() - group.lastJobBatchCreatedAt.toMillis() >= JOB_DEBOUNCE_MS;
+          if (!(weather.heavyRainExpected && weather.risk > RISK_THRESHOLD && groupDebouncePassed)) return;
+
+          // Only inlets whose own 48h debounce has passed get a fresh job.
+          const affected = memberDocs.filter((m) => {
+            const last = m.data().lastNotificationAndCleaningJobCreated;
+            return !last || nowTs.toMillis() - last.toMillis() >= JOB_DEBOUNCE_MS;
+          });
+
+          // Stamp the group debounce regardless so we don't re-evaluate every hour.
+          if (affected.length === 0) {
+            await groupDoc.ref.update({ lastJobBatchCreatedAt: nowTs });
+            return;
+          }
+
+          // Batch-create one job per affected inlet + stamp the per-inlet debounce.
+          await runBatched(affected, (batch, m) => {
+            applyCleaningJobToBatch(batch, m.id, weather.risk, { lastNotificationAndCleaningJobCreated: nowTs });
+          });
+          stats.jobsCreated += affected.length;
+
+          // Record the group debounce BEFORE scheduling pushes, so a push failure
+          // can't cause a duplicate job batch next run (mirrors the legacy ordering).
+          await groupDoc.ref.update({ lastJobBatchCreatedAt: nowTs });
+
+          const tokens = await collectSubscriberTokens(affected);
+          if (tokens.length > 0) {
+            const only = affected.length === 1 ? affected[0].data() : null;
+            await schedulePushNotifications(db, {
+              tokens,
+              title: 'Inlet Cleaning Needed',
+              body: only ? (only.address ? `The Inlet at ${only.address} needs cleaning.` : 'An Inlet you follow requires cleaning.') : 'Rain is expected — inlets you follow need cleaning.',
+            });
+            stats.pushSubscribers += tokens.length;
+          }
+        } catch (err) {
+          stats.failures++;
+          console.error(`[checkGroupWeather] Group ${groupDoc.id} failed: ${err.message}`);
+        }
+      }),
+    ),
+  );
+
+  console.log(`[checkGroupWeather] Done. ${JSON.stringify(stats)}`);
+}
+
+export const checkGroupWeather = onSchedule(
+  {
+    schedule: '0 * * * *',
+    timeZone: 'America/New_York',
+    region: 'us-east4',
+    nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '512MiB',
+  },
+  async () => {
+    if (!GROUP_WEATHER_ENABLED) {
+      console.log('[checkGroupWeather] Skipped: GROUP_WEATHER_ENABLED is false. Use triggerGroupWeather for backfill/shadow runs.');
+      return;
+    }
+    await runGroupWeather({ createJobs: true });
+    return null;
+  },
+);
+
+/*********************************************************
+ * Geolocation-Grouped Weather — manual triggers
+ *********************************************************/
+export const triggerRebuildGroups = onRequest(
+  {
+    region: 'us-east4',
+    nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '1GiB',
+  },
+  async (_req, res) => {
+    await rebuildGroups();
+    res.send('Inlet groups rebuilt.');
+  },
+);
+
+export const triggerGroupWeather = onRequest(
+  {
+    region: 'us-east4',
+    nodeVersion: '20',
+    timeoutSeconds: 540,
+    memory: '512MiB',
+  },
+  async (req, res) => {
+    // ?dryRun=1 → weather + display writes only, no jobs/pushes (shadow run).
+    const dryRun = req.query.dryRun === '1' || req.query.dryRun === 'true';
+    await runGroupWeather({ createJobs: !dryRun });
+    res.send(`Group weather run complete (createJobs=${!dryRun}).`);
+  },
+);
 
 const normalizeGeo = (lat, lng) => {
   return `${lat.toFixed(6)},${lng.toFixed(6)}`;
